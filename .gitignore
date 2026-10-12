@@ -1,0 +1,34 @@
+# Build output and authoring-only tools
+/dist/
+node_modules/
+/.local-authoring/
+.DS_Store
+*.log
+
+# Do not commit original inventory, sales, credentials or browser exports.
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.tsv
+*.zip
+*.bak
+*.backup
+.env
+.env.*
+*.pem
+*.key
+*dashboard.enc.json
+*SKU规则*.json
+/data/
+/uploads/
+/backups/
+/private/
+/outputs/
+
+# Only these fabricated CSV examples are approved for this public repository.
+!/examples/stock-mks.csv
+!/examples/stock-pnk.csv
+!/examples/stock-bali.csv
+!/examples/sales-shopee.csv
+!/examples/sales-tiktok.csv

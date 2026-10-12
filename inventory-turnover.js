@@ -1,0 +1,350 @@
+(() => {
+  'use strict';
+
+  const WAREHOUSES = { mks: '马卡萨', pnk: '坤甸', bali: '巴厘岛', unassigned: '未分配' };
+  const STORE_COLUMNS = [
+    { key: 'shop1', label: '1店' }, { key: 'shop2', label: '2店' }, { key: 'shop3', label: '3店' },
+    { key: 'shop4', label: '4店' }, { key: 'shop5', label: '5店' }, { key: 'tiktok', label: 'TikTok' }
+  ];
+  const APP_VERSION = 'v3.4.3';
+  const SLOT = {
+    mks: { label: '马卡萨仓库存', type: 'stock', warehouse: 'mks' },
+    pnk: { label: '坤甸仓库存', type: 'stock', warehouse: 'pnk' },
+    bali: { label: '巴厘岛仓库存', type: 'stock', warehouse: 'bali' },
+    shopee: { label: 'Shopee 分店销量', type: 'shopee' },
+    tiktok: { label: 'TikTok Shop 销量', type: 'tiktok' }
+  };
+  const SKU = window.RealmeSkuCore;
+  if (!SKU) throw new Error('SKU 识别组件没有加载，请重新打开网页。');
+  const { DEFAULT_RULES, clean, norm, key, memory, stockSkuProblems, candidateScore, isGiftSku, isPhoneModel, resolveMatch } = SKU;
+  const $ = (id) => document.getElementById(id);
+  const app = { profiles: {}, rules: structuredClone(DEFAULT_RULES), sourceChoice: null, sourceConfirmed: false, view: 'model', scope: 'all', sort: 'turnAsc', result: null, historySnapshot: null, db: null };
+
+  function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  function num(value) { const n = Number(String(value ?? '').replace(/[,，\s]/g, '').replace(/[^0-9.-]/g, '')); return Number.isFinite(n) ? n : 0; }
+  function isSummary(value) { const s = key(value); return !s || /(total|subtotal|grandtotal|heji|zongji|xiaoj|dianpuheji)$/.test(s) || /(?:总计|合计|小计|汇总|店铺合计)/.test(String(value ?? '')); }
+  function color(value) { return SKU.color(value, app.rules); }
+  function parseSKU(raw, parts = {}, override = null) { return SKU.parseSKU(raw, parts, override, app.rules); }
+  function show(message, type = 'info') { const node = $('notice'); node.textContent = message; node.className = `notice show ${type}`; }
+  function setStatus(text, type = 'normal') { const node = $('status'); node.textContent = text; node.style.background = type === 'warn' ? 'var(--amber-soft)' : type === 'error' ? 'var(--red-soft)' : 'var(--brand-soft)'; node.style.color = type === 'warn' ? 'var(--amber)' : type === 'error' ? 'var(--red)' : 'var(--brand)'; }
+
+  function cloneDefaults() { return structuredClone(DEFAULT_RULES); }
+  function mergeRules(saved) {
+    const base = cloneDefaults();
+    return { modelAliases: { ...base.modelAliases, ...(saved?.modelAliases || {}) }, colorAliases: { ...base.colorAliases, ...(saved?.colorAliases || {}) }, manual: { ...(saved?.manual || {}) }, stockOverrides: { ...(saved?.stockOverrides || {}) } };
+  }
+
+  function createStore() {
+    const fallback = {
+      get(name) { try { return JSON.parse(localStorage.getItem(`turnover.v3.${name}`) || 'null'); } catch { return null; } },
+      set(name, value) { localStorage.setItem(`turnover.v3.${name}`, JSON.stringify(value)); },
+      history() { return this.get('history') || []; },
+      saveHistory(row) { const list = [row, ...this.history()].slice(0, 30); this.set('history', list); return list; },
+      deleteHistory(id) { this.set('history', this.history().filter(x => x.id !== id)); }
+    };
+    if (!window.indexedDB) return Promise.resolve(fallback);
+    return new Promise(resolve => {
+      const request = indexedDB.open('realme-turnover-stable-v1', 1);
+      request.onupgradeneeded = () => { const db = request.result; if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings'); if (!db.objectStoreNames.contains('history')) db.createObjectStore('history', { keyPath: 'id' }); };
+      request.onerror = () => resolve(fallback);
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = (store, mode = 'readonly') => db.transaction(store, mode).objectStore(store);
+        resolve({
+          get(name) { return new Promise(r => { const q = tx('settings').get(name); q.onsuccess = () => r(q.result ?? null); q.onerror = () => r(null); }); },
+          set(name, value) { return new Promise(r => { const q = tx('settings', 'readwrite').put(value, name); q.onsuccess = q.onerror = () => r(); }); },
+          history() { return new Promise(r => { const q = tx('history').getAll(); q.onsuccess = () => r((q.result || []).sort((a, b) => b.createdAt - a.createdAt)); q.onerror = () => r([]); }); },
+          saveHistory(row) { return new Promise(async r => { const rows = await this.history(); rows.slice(29).forEach(x => tx('history', 'readwrite').delete(x.id)); const q = tx('history', 'readwrite').put(row); q.onsuccess = q.onerror = () => r(); }); },
+          deleteHistory(id) { return new Promise(r => { const q = tx('history', 'readwrite').delete(id); q.onsuccess = q.onerror = () => r(); }); }
+        });
+      };
+    });
+  }
+
+  function header(value) { return norm(String(value ?? '').normalize('NFKC')).replace(/[ _-]/g, ''); }
+  function headerScore(row, slot) {
+    const m = detectMapping(row.map(x => String(x ?? '')), slot);
+    if (slot === 'stock') return (m.sku ? 8 : 0) + (m.qty ? 8 : 0);
+    if (slot === 'tiktok') return (m.model ? 7 : 0) + (m.memory ? 4 : 0) + (m.color ? 3 : 0) + (m.qty ? 7 : 0);
+    return (m.sku ? 7 : 0) + (m.shop ? 6 : 0) + (m.qty ? 7 : 0) + (m.stores.length ? 4 : 0);
+  }
+  function uniqueHeaders(row) { const seen = {}; return row.map((v, i) => { const base = String(v || `列${i + 1}`).trim() || `列${i + 1}`; seen[base] = (seen[base] || 0) + 1; return seen[base] === 1 ? base : `${base} ${seen[base]}`; }); }
+  function field(headers, names) { const candidates = headers.filter(h => h.length <= 40); return candidates.find(h => names.includes(header(h))) || candidates.find(h => names.some(n => header(h).includes(n))) || ''; }
+  function salesQuantityField(headers) {
+    const names = ['净成交数量','净成交台数','净成交','净销量','有效销量','净销售数量','netsoldquantity','netquantity','netunitssold','周销量','销量','销售数量','salesvolume','quantitysold','soldquantity','unitssold','totalsold','orderquantity','quantity','qty','sold','sales','jumlah','订单量','数量'];
+    const candidates = headers.filter(h => h.length <= 40 && !/占比|比例|率|百分|金额|单价|收入|毛利|结算|percent|share|ratio|rate|amount|price|revenue|profit/i.test(h));
+    const normalized = h => header(h).replace(/\([^)]*\)/g, '').replace(/(?:台|件|pcs|units)$/i, '');
+    for (const name of names) { const found = candidates.find(h => normalized(h) === name); if (found) return found; }
+    return field(candidates, names);
+  }
+  function value(record, column) { return column ? record[column] : ''; }
+  function sheetInfo(name, matrix, kind) {
+    let hi = 0, best = -1;
+    for (let i = 0; i < Math.min(35, matrix.length); i++) { const score = headerScore(matrix[i] || [], kind); if (score > best) { best = score; hi = i; } }
+    const headers = uniqueHeaders(matrix[hi] || []);
+    const records = matrix.slice(hi + 1).map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? '']))).filter(r => Object.values(r).some(v => String(v).trim()));
+    return { name, headerIndex: hi, headers, records, score: best, mapping: detectMapping(headers, kind) };
+  }
+  function detectMapping(headers, kind) {
+    const sku = field(headers, ['商家编码','sellersku','variationsku','productsku','sku','商品名称','产品名称','商品sku','商品编码','itemname','productname','producttitle','namaproduk','namaprodukdanvariasi','description','title','variation','variasi']);
+    const qtyStock = field(headers, ['oms可支配库存','可用库存','可用数量','availablequantity','available','availablestock','actualquantity','stocktersedia','stock','库存数量','库存','inventory','quantity','qty','jumlah','onhand']);
+    const qtySales = salesQuantityField(headers);
+    const model = field(headers, ['机型','model','型号','productmodel']);
+    const memory = field(headers, ['内存版本','memoryversion','memory','ramrom','storage','规格','version']);
+    const color = field(headers, ['颜色','color','warna']);
+    const shop = field(headers, ['店铺名称','店铺','namatoko','shopname','storename','shop','store','channel','渠道']);
+    const stores = headers.filter(h => /^(?:[1-5]店|shop[1-5]|store[1-5])$/.test(header(h)));
+    return kind === 'stock' ? { sku, qty: qtyStock } : kind === 'tiktok' ? { model, memory, color, qty: qtySales } : { sku, shop, qty: qtySales, stores };
+  }
+  function chooseSheet(sheets, slot) {
+    const kind = SLOT[slot].type;
+    const sorted = [...sheets].sort((a, b) => (b.score * 1000 + b.records.length) - (a.score * 1000 + a.records.length));
+    if (kind === 'shopee') return sorted.find(s => shopeeMode(s.mapping)) || sorted[0];
+    if (kind === 'tiktok') {
+      const valid = sorted.filter(s => s.mapping.model && s.mapping.qty);
+      return valid.find(s => /sku.*(?:汇总|summary)|(?:汇总|summary).*sku/i.test(s.name)) || valid[0] || sorted[0];
+    }
+    return sorted[0];
+  }
+  async function readFile(slot, file) {
+    if (!window.XLSX) throw new Error('Excel 读取组件没有加载，请重新打开网页。');
+    const data = await file.arrayBuffer();
+    const book = XLSX.read(data, { type: 'array', cellDates: false });
+    const kind = SLOT[slot].type;
+    const sheets = book.SheetNames.map(name => sheetInfo(name, XLSX.utils.sheet_to_json(book.Sheets[name], { header: 1, defval: '', raw: false }), kind));
+    const chosen = chooseSheet(sheets, slot);
+    if (!chosen?.records.length) throw new Error('没有找到可读取的数据行。');
+    if (slot === 'shopee') { app.sourceChoice = null; app.sourceConfirmed = false; }
+    app.profiles[slot] = { slot, fileName: file.name, sheets, chosenName: chosen.name };
+    renderPreview();
+  }
+  function profile(slot) { const p = app.profiles[slot]; return p ? p.sheets.find(s => s.name === p.chosenName) : null; }
+  function schemaText(slot, sheet) {
+    if (!sheet) return '等待文件'; const m = sheet.mapping;
+    if (slot === 'shopee' && shopeeMode(m) === 'pivot') return `SKU：${m.sku}；店铺销量列：${m.stores.join('、')}（横向表）`;
+    const pairs = SLOT[slot].type === 'stock' ? [['SKU', m.sku], ['库存', m.qty]] : SLOT[slot].type === 'tiktok' ? [['机型', m.model], ['内存', m.memory], ['颜色', m.color], ['销量', m.qty]] : [['SKU', m.sku], ['店铺', m.shop], ['销量', m.qty]];
+    return pairs.map(([a, b]) => `${a}：${b || '未找到'}`).join('；');
+  }
+  function shopeeMode(mapping) {
+    if (!mapping?.sku) return '';
+    if (mapping.stores?.length) return 'pivot';
+    return mapping.shop && mapping.qty ? 'detail' : '';
+  }
+  function rawSummary(slot) {
+    const s = profile(slot); if (!s) return { rows: 0, quantity: 0, valid: false, excludedRows: 0, excludedQuantity: 0 };
+    const type = SLOT[slot].type, m = s.mapping, mode = type === 'shopee' ? shopeeMode(m) : '';
+    let rows = 0, quantity = 0, excludedRows = 0, excludedQuantity = 0;
+    const byStore = emptyStoreSales();
+    for (const r of s.records) {
+      const raw = value(r, type === 'tiktok' ? m.model : m.sku);
+      if (!raw || isSummary(raw)) continue;
+      const q = mode === 'pivot' ? m.stores.reduce((sum, col) => sum + Math.max(0, num(value(r, col))), 0) : Math.max(0, num(value(r, m.qty)));
+      if (isGiftSku(raw)) { excludedRows++; excludedQuantity += q; continue; }
+      rows++; quantity += q;
+    }
+    if (type === 'shopee') for (const r of shopeeRows(s, mode)) {
+      const store = storeKey(r.shop); if (store) byStore[store] += r.qty;
+    }
+    const fieldsValid = type === 'stock' ? m.sku && m.qty : type === 'tiktok' ? m.model && m.qty : mode;
+    return { rows, quantity, byStore, excludedRows, excludedQuantity, valid: rows + excludedRows > 0 && Boolean(fieldsValid) };
+  }
+  function findShopeeSheets() {
+    const p = app.profiles.shopee; if (!p) return {};
+    const selected = profile('shopee'), mode = shopeeMode(selected?.mapping);
+    const detail = mode === 'detail' ? selected : p.sheets.find(s => shopeeMode(s.mapping) === 'detail');
+    const pivot = mode === 'pivot' ? selected : p.sheets.find(s => shopeeMode(s.mapping) === 'pivot');
+    return { detail, pivot };
+  }
+  function shopeeRows(sheet, mode) {
+    if (!sheet || !mode) return []; const m = sheet.mapping, out = [];
+    if (mode === 'pivot') {
+      for (const r of sheet.records) { const sku = value(r, m.sku); if (!sku || isSummary(sku) || isGiftSku(sku)) continue; for (const store of m.stores) { const q = num(value(r, store)); if (q > 0) out.push({ sku, shop: store, qty: q }); } }
+    } else {
+      for (const r of sheet.records) { const sku = value(r, m.sku), shop = value(r, m.shop), qty = num(value(r, m.qty)); if (!sku || isSummary(sku) || isGiftSku(sku) || qty <= 0) continue; out.push({ sku, shop, qty }); }
+    }
+    return out;
+  }
+  function reconcileShopee() {
+    const { detail, pivot } = findShopeeSheets(); const detailRows = shopeeRows(detail, 'detail'), pivotRows = shopeeRows(pivot, 'pivot');
+    if (!detail || !pivot) return { hasBoth: false, detailRows, pivotRows, differences: [] };
+    const group = rows => rows.reduce((a, x) => { const k = `${norm(x.sku)}|${storeKey(x.shop) || norm(x.shop)}`; a[k] = (a[k] || 0) + x.qty; return a; }, {});
+    const a = group(detailRows), b = group(pivotRows), keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    const differences = [...keys].filter(k => (a[k] || 0) !== (b[k] || 0)).map(k => ({ key: k, detail: a[k] || 0, pivot: b[k] || 0 }));
+    return { hasBoth: true, detailRows, pivotRows, differences };
+  }
+  function renderPreview() {
+    const loaded = Object.keys(app.profiles).length; $('previewCard').classList.toggle('hidden', !loaded); if (!loaded) return;
+    $('previewGrid').innerHTML = Object.keys(SLOT).map(slot => {
+      const p = app.profiles[slot], s = profile(slot), summary = rawSummary(slot); if (!p) return `<div class="preview"><strong>${SLOT[slot].label}</strong><p>等待上传</p></div>`;
+      const options = p.sheets.map(x => `<option value="${esc(x.name)}" ${x.name === p.chosenName ? 'selected' : ''}>${esc(x.name)}（${x.records.length} 行）</option>`).join('');
+      return `<div class="preview"><strong>${SLOT[slot].label}</strong><p class="file">${esc(p.fileName)}</p><p>工作表：<select class="sheet-select" data-slot="${slot}">${options}</select></p><p>${esc(schemaText(slot, s))}</p><p class="${summary.valid ? 'ok' : 'bad'}">${summary.valid ? `读取 ${summary.rows} 行，数量 ${summary.quantity.toLocaleString()}` : '字段不完整，不能参与计算'}</p>${summary.excludedRows ? `<p>已排除赠品 zp888：${summary.excludedRows} 行，数量 ${summary.excludedQuantity.toLocaleString()}</p>` : ''}</div>`;
+    }).join('');
+    document.querySelectorAll('.sheet-select').forEach(node => node.onchange = () => { app.profiles[node.dataset.slot].chosenName = node.value; app.sourceChoice = null; app.sourceConfirmed = false; renderPreview(); });
+    renderAudit();
+  }
+  function renderAudit() {
+    const stockSlots = ['mks', 'pnk', 'bali'], allLoaded = Object.keys(SLOT).every(x => app.profiles[x]);
+    const stockChecks = stockSlots.map(x => ({ slot: x, ...rawSummary(x) })); const tk = rawSummary('tiktok'), sh = rawSummary('shopee'); const rec = reconcileShopee();
+    const stockTotal = stockChecks.reduce((a, x) => a + x.quantity, 0); const stockText = stockChecks.map(x => `${WAREHOUSES[x.slot]} ${x.quantity.toLocaleString()}`).join('、');
+    let html = `<div class="audit-item ${stockChecks.every(x => x.valid) ? 'good' : 'alert'}"><strong>库存控制数</strong><p>${stockText || '等待库存文件'}；合计 ${stockTotal.toLocaleString()}</p><p class="hint">${stockChecks.every(x => x.valid) ? '三个仓库均已找到 SKU 和库存字段。' : '请在上方为每个库存文件选择正确工作表。'}</p></div>`;
+    if (stockChecks.every(x => x.valid)) {
+      const problems = stocksFromInputs().filter(x => stockSkuProblems(x.sku).length);
+      html += `<div class="audit-item ${problems.length ? 'alert' : 'good'}"><strong>库存 SKU 识别自检</strong><p>${problems.length ? `${problems.length} 条库存 SKU 需要补全` : '全部库存 SKU 均已识别完整'}</p><p class="hint">${problems.length ? `示例：${esc(problems.slice(0, 2).map(x => `${x.sku.raw}（${stockSkuProblems(x.sku).join('、')}）`).join('；'))}。计算后可在下方逐条修正。` : '每条库存都有可用于匹配的型号、内存和颜色信息。'}</p></div>`;
+    }
+    html += `<div class="audit-item ${tk.valid ? 'good' : 'alert'}"><strong>TikTok 周销量</strong><p>${tk.valid ? `${tk.rows} 条 SKU，合计 ${tk.quantity.toLocaleString()}` : '尚未识别到机型和净成交数量字段'}</p></div>`;
+    if (rec.hasBoth) {
+      const detailTotal = rec.detailRows.reduce((a, x) => a + x.qty, 0), pivotTotal = rec.pivotRows.reduce((a, x) => a + x.qty, 0), mismatch = rec.differences.length;
+      html += `<div class="audit-item ${mismatch ? 'alert' : 'good'}"><strong>Shopee 两张表对账</strong><p>分组明细 ${detailTotal.toLocaleString()}；透视表 ${pivotTotal.toLocaleString()}${mismatch ? `；发现 ${mismatch} 项差异` : '；完全一致'}</p>${mismatch ? `<p class="hint">计算前请选择采用哪一个来源：<label><input type="radio" name="shopeeSource" value="detail" ${app.sourceChoice === 'detail' ? 'checked' : ''}> 分组明细</label> <label><input type="radio" name="shopeeSource" value="pivot" ${app.sourceChoice === 'pivot' ? 'checked' : ''}> 透视表</label></p><p class="hint">示例：${rec.differences.slice(0, 2).map(x => `${esc(x.key.split('|')[0])}（明细 ${x.detail} / 透视 ${x.pivot}）`).join('；')}</p>` : ''}</div>`;
+    } else html += `<div class="audit-item ${sh.valid ? 'good' : 'alert'}"><strong>Shopee 周销量</strong><p>${sh.valid ? `${sh.rows} 条 SKU，合计 ${sh.quantity.toLocaleString()}` : '尚未识别到 SKU 和分店销量列，或店铺、销量字段'}</p>${sh.valid ? `<p class="hint">${STORE_COLUMNS.slice(0,5).map(x => `${x.label} ${sh.byStore[x.key].toLocaleString()}`).join('；')}</p>` : ''}</div>`;
+    $('audit').innerHTML = html;
+    document.querySelectorAll('[name=shopeeSource]').forEach(x => x.onchange = () => { app.sourceChoice = x.value; app.sourceConfirmed = true; updateCalculateButton(); });
+    updateCalculateButton(allLoaded, stockChecks, tk, sh, rec);
+  }
+  function updateCalculateButton(allLoaded, stockChecks, tk, sh, rec) {
+    const ready = (allLoaded ?? Object.keys(SLOT).every(x => app.profiles[x])) && (stockChecks ?? ['mks','pnk','bali'].map(rawSummary)).every(x => x.valid) && (tk ?? rawSummary('tiktok')).valid && (sh ?? rawSummary('shopee')).valid;
+    const conflict = (rec ?? reconcileShopee()).hasBoth && (rec ?? reconcileShopee()).differences.length && !app.sourceConfirmed;
+    $('calculate').disabled = !ready || conflict;
+    setStatus(!ready ? '等待正确字段' : conflict ? '需要确认 Shopee 来源' : '可以计算周转', conflict ? 'warn' : 'normal');
+  }
+
+  function storeKey(shop) {
+    const s = norm(String(shop ?? '').normalize('NFKC'));
+    if (/tiktok|\btk\b/.test(s)) return 'tiktok';
+    const found = STORE_COLUMNS.slice(0, 5).find(({ key }) => new RegExp(`(?:${key.slice(-1)}\\s*店|shop\\s*${key.slice(-1)}\\b|store\\s*${key.slice(-1)}\\b)`).test(s));
+    return found?.key || '';
+  }
+  function warehouse(shop) { const store = storeKey(shop); if (store === 'tiktok' || store === 'shop1' || store === 'shop3') return 'bali'; if (store === 'shop4') return 'pnk'; if (store === 'shop2' || store === 'shop5') return 'mks'; return 'unassigned'; }
+  function emptyStoreSales() { return Object.fromEntries(STORE_COLUMNS.map(x => [x.key, 0])); }
+  function storeSales(row, store) { return row.byStore ? row.byStore[store] || 0 : null; }
+  function matchStatus(row) { return row.unmatched ? ['待确认', 'none'] : ['已匹配', 'good']; }
+  function scopeDescription(scope) {
+    if (scope === 'bali') return '巴厘岛仓库存 + 1店、3店、TikTok 销量';
+    if (scope === 'pnk') return '坤甸仓库存 + 4店销量';
+    if (scope === 'mks') return '马卡萨仓库存 + 2店、5店销量';
+    return '三仓库存合计 + 1–5店、TikTok 销量合计';
+  }
+  function stocksFromInputs() { const out = []; for (const slot of ['mks','pnk','bali']) { const s = profile(slot), m = s.mapping; for (const r of s.records) { const raw = value(r, m.sku); if (!raw || isSummary(raw) || isGiftSku(raw)) continue; const initial = parseSKU(raw), saved = app.rules.stockOverrides?.[initial.rawKey]; out.push({ sku: saved ? parseSKU(raw, {}, saved) : initial, warehouse: slot, qty: Math.max(0, num(value(r, m.qty))), source: SLOT[slot].label }); } } return out; }
+  function salesFromInputs() {
+    const out = [], t = profile('tiktok'); if (t) for (const r of t.records) { const raw = value(r, t.mapping.model), qty = num(value(r, t.mapping.qty)); if (!raw || isSummary(raw) || isGiftSku(raw) || qty <= 0) continue; out.push({ sku: parseSKU(raw, { model: raw, memory: value(r, t.mapping.memory), color: value(r, t.mapping.color) }), warehouse: 'bali', store: 'tiktok', qty, source: 'TikTok' }); }
+    const rec = reconcileShopee(), selected = profile('shopee'), mode = app.sourceChoice || shopeeMode(selected?.mapping);
+    const rows = rec.hasBoth ? (mode === 'pivot' ? rec.pivotRows : rec.detailRows) : shopeeRows(selected, mode);
+    for (const r of rows) out.push({ sku: parseSKU(r.sku), warehouse: warehouse(r.shop), store: storeKey(r.shop), qty: r.qty, source: `Shopee ${r.shop}` });
+    return out;
+  }
+  function matchingRuleKey(sku) { return sku.recognizedModel && (!isPhoneModel(sku.model) || sku.memory) ? `sku:${sku.fullKey}` : sku.rawKey; }
+  function rememberMapping(issue, target) {
+    // One removable rule per semantic SKU, not one rule per repeated order.
+    for (const raw of issue.rawKeys || [issue.sku.rawKey]) delete app.rules.manual[raw];
+    app.rules.manual[matchingRuleKey(issue.sku)] = target;
+  }
+  function matchSales(stocks, sales) {
+    const catalog = [...new Map(stocks.filter(x => !x.sku.excluded && !stockSkuProblems(x.sku).length).map(x => [x.sku.fullKey, x.sku])).values()]; const manual = app.rules.manual || {}; const issues = new Map();
+    for (const sale of sales) {
+      const forced = manual[matchingRuleKey(sale.sku)] || manual[sale.sku.rawKey];
+      const match = resolveMatch(sale.sku, catalog, forced);
+      const candidates = catalog.map(x => ({ sku: x, score: candidateScore(sale.sku, x) })).filter(x => x.score > 0).sort((a,b) => b.score-a.score);
+      sale.targetKey = match.target?.fullKey || ''; sale.matchType = match.type || '待确认'; sale.matchReason = match.reason; sale.candidates = candidates.slice(0, 8);
+      if (!match.target) {
+        const id = matchingRuleKey(sale.sku);
+        if (!issues.has(id)) issues.set(id, { ...sale, qty: 0, rowCount: 0, rawKeys: [], sources: [], reason: match.reason });
+        const issue = issues.get(id); issue.qty += sale.qty; issue.rowCount++;
+        if (!issue.rawKeys.includes(sale.sku.rawKey)) issue.rawKeys.push(sale.sku.rawKey);
+        if (!issue.sources.includes(sale.source)) issue.sources.push(sale.source);
+        issue.source = issue.sources.join('、');
+      }
+    }
+    return [...issues.values()];
+  }
+  async function saveIssueMapping(index, target) {
+    const issue = app.result?.issues[index];
+    if (!issue || !target) return show('请先选择一个库存 SKU。', 'error');
+    rememberMapping(issue, target);
+    await saveRules(); calculate(true);
+    show(`已记住「${issue.sku.raw}」的对应关系，共处理 ${issue.rowCount || 1} 条明细；下次导入自动沿用。`, 'ok');
+  }
+  function groupRows(stocks, sales, view, scope) {
+    const rows = new Map(); const add = (id, base) => { if (!rows.has(id)) rows.set(id, { ...base, stock: 0, sales: 0, byStore: emptyStoreSales(), unmatched: false }); return rows.get(id); };
+    stocks.filter(x => scope === 'all' || x.warehouse === scope).forEach(x => { const id = view === 'model' ? x.sku.modelKey : x.sku.fullKey; const row = add(id, { name: x.sku.model, memory: x.sku.memory, color: x.sku.color }); row.stock += x.qty; });
+    sales.filter(x => scope === 'all' ? true : x.warehouse === scope).forEach(x => { const target = x.targetKey ? stocks.find(y => y.sku.fullKey === x.targetKey)?.sku : null; const id = view === 'model' ? (target?.modelKey || x.sku.modelKey) : (x.targetKey || `unmatched:${x.sku.recognizedModel ? x.sku.fullKey : x.sku.rawKey}`); const row = add(id, { name: target?.model || x.sku.model, memory: target?.memory || x.sku.memory, color: target?.color || x.sku.color }); row.sales += x.qty; if (x.store && Object.hasOwn(row.byStore, x.store)) row.byStore[x.store] += x.qty; if (!x.targetKey) row.unmatched = true; });
+    return [...rows.values()].map(x => ({ ...x, turnover: x.sales ? x.stock / (x.sales / 7) : null }));
+  }
+  function sorted(rows) { const sorters = { turnAsc: (a,b) => (a.turnover ?? Infinity) - (b.turnover ?? Infinity), turnDesc: (a,b) => (b.turnover ?? -Infinity) - (a.turnover ?? -Infinity), stockDesc: (a,b) => b.stock - a.stock, salesDesc: (a,b) => b.sales - a.sales, nameAsc: (a,b) => a.name.localeCompare(b.name) }; return [...rows].sort(sorters[app.sort]); }
+  function calculate(save = true) {
+    const stocks = stocksFromInputs(), sales = salesFromInputs(), issues = matchSales(stocks, sales), stockIssues = stocks.filter(x => stockSkuProblems(x.sku).length); const modelRows = groupRows(stocks, sales, 'model', 'all'), skuRows = groupRows(stocks, sales, 'sku', 'all');
+    app.historySnapshot = null; app.result = { stocks, sales, issues, stockIssues, modelRows, skuRows, createdAt: Date.now(), audit: auditSnapshot() }; $('report').classList.remove('hidden'); renderReport(); if (save) saveSnapshot(); const hasIssues = issues.length || stockIssues.length; setStatus(`已完成：${stocks.length} 条库存、${sales.length} 条销量`, hasIssues ? 'warn' : 'normal'); show(hasIssues ? `已计算。库存有 ${stockIssues.length} 条需要补全识别；销售仅剩 ${issues.length} 种 SKU 需要确认（重复明细已合并）。` : '已计算，库存和销售 SKU 均已匹配。', hasIssues ? 'warn' : 'ok');
+  }
+  function auditSnapshot() { const rec = reconcileShopee(); return { stock: ['mks','pnk','bali'].map(x => ({ warehouse: WAREHOUSES[x], ...rawSummary(x) })), tiktok: rawSummary('tiktok'), shopee: rec.hasBoth ? { detail: rec.detailRows.reduce((a,x) => a+x.qty,0), pivot: rec.pivotRows.reduce((a,x) => a+x.qty,0), choice: app.sourceChoice, differences: rec.differences } : { chosen: rawSummary('shopee').quantity } }; }
+  function renderReport() {
+    if (!app.result) return; if (app.historySnapshot) return renderHistorical(app.historySnapshot); const { stocks, sales, issues, stockIssues } = app.result; const scopedStocks = stocks.filter(x => app.scope === 'all' || x.warehouse === app.scope), scopedSales = sales.filter(x => app.scope === 'all' || x.warehouse === app.scope); const stock = scopedStocks.reduce((a,x)=>a+x.qty,0), sold = scopedSales.reduce((a,x)=>a+x.qty,0), rows = sorted(groupRows(stocks, sales, app.view, app.scope));
+    $('metrics').innerHTML = `<div class="metric"><small>可用库存</small><div class="n">${stock.toLocaleString()}</div><small>${app.scope === 'all' ? '三个仓库合计' : WAREHOUSES[app.scope]}</small></div><div class="metric"><small>上周销量</small><div class="n">${sold.toLocaleString()}</div><small>以已确认来源为准</small></div><div class="metric"><small>整体周转</small><div class="n">${sold ? `${(stock / (sold / 7)).toFixed(1)} 天` : '—'}</div><small>库存 ÷（周销量 ÷ 7）</small></div><div class="metric"><small>库存识别异常</small><div class="n">${stockIssues.length}</div><small>需补全型号、内存或颜色</small></div><div class="metric"><small>销售待确认 SKU</small><div class="n">${issues.length}</div><small>不会自动强行匹配</small></div>`;
+    $('reportHint').textContent = `${scopeDescription(app.scope)} · ${app.view === 'model' ? '型号已合并内存、颜色' : '完整 SKU 保留内存、颜色'} · 分店销量合计为周销量 · ${rows.length} 条记录`;
+    $('thead').innerHTML = `<tr><th>${app.view === 'model' ? '型号' : '型号 / SKU'}</th><th>可用库存</th>${STORE_COLUMNS.map(x => `<th>${x.label}</th>`).join('')}<th>周销量</th><th>日均销量</th><th>周转天数</th><th>匹配状态</th></tr>`;
+    $('tbody').innerHTML = rows.length ? rows.map(r => { const [label, cls] = matchStatus(r); return `<tr><td><span class="name">${esc(r.name)}</span>${app.view === 'sku' ? `<span class="detail">${esc([r.memory, r.color].filter(Boolean).join(' · ') || '未识别规格')}${r.unmatched ? ' · 未对应库存 SKU' : ''}</span>` : ''}</td><td>${r.stock.toLocaleString()}</td>${STORE_COLUMNS.map(x => `<td>${storeSales(r, x.key).toLocaleString()}</td>`).join('')}<td>${r.sales.toLocaleString()}</td><td>${(r.sales / 7).toFixed(2)}</td><td class="name">${r.turnover == null ? '无销量' : `${r.turnover.toFixed(1)} 天`}</td><td><span class="tag ${cls}">${label}</span></td></tr>`; }).join('') : '<tr><td colspan="12" class="empty">当前范围没有记录。</td></tr>';
+    renderStockIssues(); renderIssues();
+  }
+  function renderStockIssues() {
+    const issues = app.result?.stockIssues || []; $('stockIssueCount').textContent = `${issues.length} 条待补全`;
+    $('stockIssues').innerHTML = issues.length ? issues.map((x, index) => {
+      const problems = stockSkuProblems(x.sku).join('、');
+      return `<div class="issue stock-issue"><strong>库存 SKU 识别不完整：${esc(x.sku.raw)}</strong><div class="raw">仓库：${esc(WAREHOUSES[x.warehouse])}；库存 ${x.qty}；问题：${esc(problems)}。</div><div class="fix-form"><input id="stock-model-${index}" type="text" value="${esc(x.sku.recognizedModel ? x.sku.model : '')}" placeholder="型号，例如 C100i"><input id="stock-memory-${index}" type="text" value="${esc(x.sku.memory)}" placeholder="内存，例如 4/128GB"><input id="stock-color-${index}" type="text" value="${esc(x.sku.color)}" placeholder="颜色，例如 Dusk Gray"><button class="btn" data-stock-fix-index="${index}">保存库存识别</button></div></div>`;
+    }).join('') : '<div class="issue" style="border-color:#a8e1c0;background:var(--green-soft)"><strong style="color:var(--green)">库存 SKU 已完整识别</strong><div class="raw">每一条库存都已识别为可用于匹配的 SKU。</div></div>';
+    document.querySelectorAll('[data-stock-fix-index]').forEach(btn => btn.onclick = async () => {
+      const i = +btn.dataset.stockFixIndex, stock = app.result.stockIssues[i]; const modelValue = clean($(`stock-model-${i}`).value), memoryValue = memory($(`stock-memory-${i}`).value) || clean($(`stock-memory-${i}`).value), colorValue = color($(`stock-color-${i}`).value) || clean($(`stock-color-${i}`).value);
+      if (!modelValue) return show('库存 SKU 至少需要填写型号。', 'error');
+      app.rules.stockOverrides[stock.sku.rawKey] = { raw: stock.sku.raw, model: modelValue, memory: memoryValue, color: colorValue }; await saveRules(); calculate(true); show(`已保存库存 SKU「${stock.sku.raw}」的识别结果。其他异常仍会保留。`, 'ok');
+    });
+  }
+  function renderIssues() {
+    const issues = app.result?.issues || []; $('issueCount').textContent = `${issues.length} 种 SKU 待确认`;
+    const matched = [...new Map((app.result?.sales || []).filter(x => x.targetKey).map(x => [`${matchingRuleKey(x.sku)}:${x.targetKey}`, x])).values()];
+    const remembered = matched.filter(x => x.matchType === '已记住的对应').length;
+    $('matchSummary').textContent = `自动匹配 ${matched.length - remembered} 种 · 沿用已记住对应 ${remembered} 种 · 仍需确认 ${issues.length} 种。重复订单不需要逐条处理。`;
+    $('matchDetails').hidden = !matched.length;
+    $('matchDetailsTitle').textContent = `查看已匹配的对应及原因（${matched.length} 种）`;
+    $('matchDetailsList').innerHTML = matched.map(x => {
+      const target = app.result.stocks.find(s => s.sku.fullKey === x.targetKey)?.sku;
+      return `<div class="rule-row"><div><b>${esc(x.sku.raw)}</b><div class="row-meta">→ ${esc(target ? [target.model, target.memory, target.color].filter(Boolean).join(' | ') : x.targetKey)}</div><div class="row-meta">${esc(x.matchType)}：${esc(x.matchReason)}</div></div></div>`;
+    }).join('');
+    $('issues').innerHTML = issues.length ? issues.map((x, index) => {
+      const checkedStocks = app.result.stocks.filter(s => !stockSkuProblems(s.sku).length);
+      const all = [...x.candidates, ...[...new Map(checkedStocks.map(s => [s.sku.fullKey, { sku: s.sku, score: 0 }])).values()].filter(z => !x.candidates.some(c => c.sku.fullKey === z.sku.fullKey))];
+      const opts = all.map(c => `<option value="${esc(c.sku.fullKey)}">${esc(c.sku.raw)}</option>`).join('');
+      return `<div class="issue"><strong>需确认：${esc(x.sku.raw)}</strong><div class="raw">来源：${esc(x.source)}；共 ${x.rowCount || 1} 条明细，周销量 ${x.qty}。</div><div class="raw">${esc(x.reason || '无法唯一对应库存 SKU')}。</div><div class="candidate"><select id="candidate-${index}"><option value="">选择对应的库存 SKU…</option>${opts}</select><button class="btn" data-map-index="${index}">保存并记住</button></div></div>`;
+    }).join('') : '<div class="issue" style="border-color:#a8e1c0;background:var(--green-soft)"><strong style="color:var(--green)">没有待确认 SKU</strong><div class="raw">销售 SKU 均已自动或手动对应库存。</div></div>';
+    document.querySelectorAll('[data-map-index]').forEach(btn => btn.onclick = () => saveIssueMapping(+btn.dataset.mapIndex, $(`candidate-${btn.dataset.mapIndex}`).value));
+  }
+  function currentRows() { return app.historySnapshot ? sorted(app.view === 'model' ? app.historySnapshot.modelRows : app.historySnapshot.skuRows) : sorted(groupRows(app.result.stocks, app.result.sales, app.view, app.scope)); }
+  function exportCsv() { if (!app.result) return; const headers = app.view === 'model' ? ['型号','可用库存',...STORE_COLUMNS.map(x => x.label),'周销量','日均销量','周转天数','匹配状态'] : ['型号','内存','颜色','可用库存',...STORE_COLUMNS.map(x => x.label),'周销量','日均销量','周转天数','匹配状态']; const data = currentRows().map(r => { const [label] = matchStatus(r), stores = STORE_COLUMNS.map(x => storeSales(r, x.key) ?? ''); const common = [r.stock,...stores,r.sales,(r.sales / 7).toFixed(2),r.turnover == null ? '无销量' : r.turnover.toFixed(1),label]; return app.view === 'model' ? [r.name,...common] : [r.name,r.memory,r.color,...common]; }); const csv = [headers,...data].map(row => row.map(x => `"${String(x).replace(/"/g,'""')}"`).join(',')).join('\r\n'); download(`周转_${app.view === 'model' ? '型号' : '完整SKU'}_${new Date().toISOString().slice(0,10)}.csv`, '\ufeff' + csv, 'text/csv;charset=utf-8'); }
+  function download(name, data, type) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([data], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 0); }
+
+  async function saveRules() { await app.db.set('rules', app.rules); renderRules(); }
+  function renderRules() {
+    const render = (target, values, type) => { const entries = Object.entries(values); $(target).innerHTML = entries.length ? entries.map(([raw, canonical]) => `<div class="rule-row"><div><b>${esc(raw)}</b> <span class="row-meta">→ ${esc(canonical)}</span></div><button class="btn danger tiny" data-rule-type="${type}" data-rule-key="${esc(raw)}">删除</button></div>`).join('') : '<div class="row-meta">暂无自定义规则。</div>'; };
+    render('modelRules', app.rules.modelAliases, 'modelAliases'); render('colorRules', app.rules.colorAliases, 'colorAliases');
+    const overrides = Object.entries(app.rules.stockOverrides || {}); $('stockOverrides').innerHTML = overrides.length ? overrides.map(([raw, value]) => `<div><div class="rule-row"><div><b>${esc(value.raw || raw)}</b><span class="row-meta"> → ${esc([value.model, value.memory, value.color].filter(Boolean).join(' · '))}</span></div><button class="btn danger tiny" data-rule-type="stockOverrides" data-rule-key="${esc(raw)}">撤销</button></div></div>`).join('') : '<div class="row-meta">暂无库存 SKU 修正。</div>';
+    const manuals = Object.entries(app.rules.manual); $('manualRules').innerHTML = manuals.length ? manuals.map(([raw, target]) => `<div class="rule-row"><div><b>${esc(raw)}</b><span class="row-meta"> → ${esc(target)}</span></div><button class="btn danger tiny" data-rule-type="manual" data-rule-key="${esc(raw)}">撤销</button></div>`).join('') : '<div class="row-meta">暂无手动 SKU 对应。</div>';
+    document.querySelectorAll('[data-rule-type]').forEach(btn => btn.onclick = async () => { delete app.rules[btn.dataset.ruleType][btn.dataset.ruleKey]; await saveRules(); if (app.result?.stocks.length) calculate(false); });
+  }
+  function openRules() { renderRules(); $('rulesDialog').showModal(); }
+  function exportRules() { download(`realme-SKU规则_${new Date().toISOString().slice(0,10)}.json`, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), rules: app.rules }, null, 2), 'application/json'); }
+  async function importRules(file) { try { const data = JSON.parse(await file.text()); app.rules = mergeRules(data.rules || data); await saveRules(); if (app.result) calculate(false); show('规则已恢复并保存到本机。', 'ok'); } catch { show('规则备份文件无法识别。', 'error'); } }
+  function snapshot() { const r = app.result; return { id: crypto.randomUUID(), createdAt: Date.now(), title: new Date().toLocaleString('zh-CN',{hour12:false}), metrics: { stock: r.stocks.reduce((a,x)=>a+x.qty,0), sales: r.sales.reduce((a,x)=>a+x.qty,0), issues: r.issues.length, stockIssues: r.stockIssues?.length || 0 }, audit: r.audit, modelRows: r.modelRows, skuRows: r.skuRows, issues: r.issues.map(x => ({ sku: x.sku, qty: x.qty, source: x.source })) }; }
+  async function saveSnapshot() { await app.db.saveHistory(snapshot()); }
+  async function showHistory() { const list = await app.db.history(); $('historyList').innerHTML = list.length ? list.map(x => `<div class="history-row"><div><b>${esc(x.title)}</b><div class="row-meta">库存 ${x.metrics.stock.toLocaleString()} · 销量 ${x.metrics.sales.toLocaleString()} · 库存待补全 ${x.metrics.stockIssues || 0} · 销售待确认 ${x.metrics.issues}</div></div><div class="actions"><button class="btn tiny" data-history-open="${x.id}">查看</button><button class="btn danger tiny" data-history-delete="${x.id}">删除</button></div></div>`).join('') : '<div class="empty">暂无历史计算记录。</div>'; $('historyDialog').showModal(); document.querySelectorAll('[data-history-open]').forEach(btn => btn.onclick = () => { const x = list.find(y => y.id === btn.dataset.historyOpen); app.historySnapshot = x; app.scope = 'all'; document.querySelectorAll('[name=scope]').forEach(node => { node.checked = node.value === 'all'; }); app.result = { stocks: [], sales: [], issues: x.issues || [], stockIssues: [], modelRows: x.modelRows || [], skuRows: x.skuRows || [], audit: x.audit }; $('historyDialog').close(); $('report').classList.remove('hidden'); renderHistorical(x); }); document.querySelectorAll('[data-history-delete]').forEach(btn => btn.onclick = async () => { await app.db.deleteHistory(btn.dataset.historyDelete); showHistory(); }); }
+  function renderHistorical(x) {
+    $('matchDetails').hidden = true; $('matchSummary').textContent = '历史快照保留当时结果；新版识别需重新上传文件计算。'; $('issueCount').textContent = '历史快照'; const rows = sorted(app.view === 'model' ? x.modelRows : x.skuRows), hasStoreDetail = rows.some(r => r.byStore); $('metrics').innerHTML = `<div class="metric"><small>历史可用库存</small><div class="n">${x.metrics.stock.toLocaleString()}</div></div><div class="metric"><small>历史周销量</small><div class="n">${x.metrics.sales.toLocaleString()}</div></div><div class="metric"><small>库存待补全</small><div class="n">${x.metrics.stockIssues || 0}</div></div><div class="metric"><small>销售待确认 SKU</small><div class="n">${x.metrics.issues}</div></div><div class="metric"><small>记录时间</small><div class="n" style="font-size:16px">${esc(x.title)}</div></div>`; $('reportHint').textContent = hasStoreDetail ? '历史快照为只读结果，可切换两张表、排序或导出；仓库范围固定为全部仓库。' : '该历史记录生成于 v3.4.0 之前，不含分店销量明细；重新上传文件计算后可查看。'; $('thead').innerHTML = `<tr><th>型号 / SKU</th><th>可用库存</th>${STORE_COLUMNS.map(x => `<th>${x.label}</th>`).join('')}<th>周销量</th><th>日均销量</th><th>周转天数</th><th>匹配状态</th></tr>`; $('tbody').innerHTML = rows.map(r => { const [label, cls] = matchStatus(r); return `<tr><td><span class="name">${esc(r.name)}</span><span class="detail">${esc([r.memory,r.color].filter(Boolean).join(' · '))}</span></td><td>${r.stock}</td>${STORE_COLUMNS.map(x => `<td>${storeSales(r, x.key) == null ? '—' : storeSales(r, x.key)}</td>`).join('')}<td>${r.sales}</td><td>${(r.sales / 7).toFixed(2)}</td><td>${r.turnover == null ? '无销量' : r.turnover.toFixed(1)+' 天'}</td><td><span class="tag ${cls}">${label}</span></td></tr>`; }).join(''); $('stockIssueCount').textContent = '历史快照'; $('stockIssues').innerHTML = '<div class="issue"><strong>这是历史快照</strong><div class="raw">历史记录只保存异常数量，不保存可编辑的库存 SKU 明细。</div></div>'; $('issues').innerHTML = '<div class="issue"><strong>这是历史快照</strong><div class="raw">历史异常明细不会改变现有规则。重新上传本周文件后可继续处理。</div></div>'; }
+
+  function bindUpload() {
+    document.querySelectorAll('.drop').forEach(box => { const slot = box.dataset.slot, input = box.querySelector('input'); const use = async file => { if (!file) return; box.classList.add('loaded'); box.querySelector('.file').textContent = file.name; try { await readFile(slot, file); show(`已读取 ${SLOT[slot].label}：请在“导入预览”确认工作表和控制数。`, 'ok'); } catch (e) { box.classList.remove('loaded'); show(`${SLOT[slot].label} 读取失败：${e.message}`, 'error'); } }; input.onchange = () => use(input.files[0]); ['dragenter','dragover'].forEach(e => box.addEventListener(e, x => { x.preventDefault(); box.classList.add('drag'); })); ['dragleave','drop'].forEach(e => box.addEventListener(e, x => { x.preventDefault(); box.classList.remove('drag'); })); box.addEventListener('drop', e => use(e.dataTransfer.files[0])); });
+  }
+  async function init() {
+    app.db = await createStore(); app.rules = mergeRules(await app.db.get('rules'));
+    $('buildVersion').textContent = `版本 ${APP_VERSION}`;
+    if (!window.XLSX) show('Excel 读取组件加载失败，请重新从本地文件打开页面。', 'error');
+    bindUpload(); $('refreshPreview').onclick = renderPreview; $('calculate').onclick = () => calculate(true); $('rulesBtn').onclick = openRules; $('historyBtn').onclick = showHistory; $('exportCsv').onclick = exportCsv; $('exportRules').onclick = exportRules; $('importRules').onchange = e => importRules(e.target.files[0]);
+    $('addModelAlias').onclick = async () => { const raw = $('modelAliasRaw').value, canonical = $('modelAliasCanonical').value; if (!raw || !canonical) return show('请填写报表写法和统一型号。', 'error'); app.rules.modelAliases[key(raw)] = clean(canonical); $('modelAliasRaw').value = $('modelAliasCanonical').value = ''; await saveRules(); if (app.result) calculate(false); };
+    $('addColorAlias').onclick = async () => { const raw = $('colorAliasRaw').value, canonical = $('colorAliasCanonical').value; if (!raw || !canonical) return show('请填写报表写法和统一颜色。', 'error'); app.rules.colorAliases[key(raw)] = clean(canonical); $('colorAliasRaw').value = $('colorAliasCanonical').value = ''; await saveRules(); if (app.result) calculate(false); };
+    document.querySelectorAll('[data-close]').forEach(btn => btn.onclick = () => $(btn.dataset.close).close()); $('sort').onchange = e => { app.sort = e.target.value; if (app.result) renderReport(); }; document.querySelectorAll('[name=scope]').forEach(x => x.onchange = e => { if (app.historySnapshot) { app.scope = 'all'; x.checked = false; document.querySelectorAll('[name=scope]').forEach(node => { node.checked = node.value === 'all'; }); return show('历史快照只保留全部仓库的计算结果。', 'info'); } app.scope = e.target.value; if (app.result) renderReport(); }); document.querySelectorAll('.tab').forEach(tab => tab.onclick = () => { document.querySelectorAll('.tab').forEach(x => x.classList.remove('active')); tab.classList.add('active'); app.view = tab.dataset.view; if (app.result) renderReport(); });
+  }
+  init();
+})();

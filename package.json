@@ -1,0 +1,13 @@
+{
+  "name": "realme-inventory-turnover",
+  "version": "3.4.3",
+  "private": true,
+  "description": "浏览器本地处理的 realme 多仓库存与分店销量周转工具",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --check inventory-turnover.js && node --check sku-core.js && node tests/sku-regression.js && node tests/examples-regression.js",
+    "build": "node sites-build.mjs",
+    "test:site": "node tests/site-regression.mjs",
+    "verify": "npm test && npm run build && npm run test:site"
+  }
+}
